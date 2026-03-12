@@ -1,0 +1,19 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "0.1.0",
+	"FriendlyName": "OCR Texture Tools",
+	"Description": "Automatically normalizes imported OCR textures inside the editor.",
+	"Category": "Developer",
+	"CreatedBy": "RainyDay0816",
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Installed": false,
+	"Modules": [
+		{
+			"Name": "OcrTextureTools",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit"
+		}
+	]
+}
