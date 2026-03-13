@@ -33,6 +33,16 @@ namespace
 		FString NormalizedName;
 	};
 
+	struct FManagedTextureAssetDataGroup
+	{
+		bool bHasBaseColor = false;
+		bool bHasNormal = false;
+		bool bHasOrm = false;
+		FAssetData BaseColorAssetData;
+		FAssetData NormalAssetData;
+		FAssetData OrmAssetData;
+	};
+
 	FString BuildIncompleteKey(const FManagedTextureInfo& Info)
 	{
 		return FString::Printf(TEXT("%s|%s"), *Info.TargetFolderPath, *Info.MaterialGroupName);
@@ -180,21 +190,21 @@ namespace
 
 bool FManagedTextureGroup::IsComplete() const
 {
-	return BaseColor != nullptr && Normal != nullptr && Orm != nullptr;
+	return bHasBaseColor && bHasNormal && bHasOrm;
 }
 
 FString FManagedTextureGroup::DescribeMissing() const
 {
 	TArray<FString> MissingKinds;
-	if (!BaseColor)
+	if (!bHasBaseColor)
 	{
 		MissingKinds.Add(TEXT("BaseColor"));
 	}
-	if (!Normal)
+	if (!bHasNormal)
 	{
 		MissingKinds.Add(TEXT("Normal"));
 	}
-	if (!Orm)
+	if (!bHasOrm)
 	{
 		MissingKinds.Add(TEXT("ORM"));
 	}
@@ -204,7 +214,7 @@ FString FManagedTextureGroup::DescribeMissing() const
 
 int32 FManagedTextureGroup::GetAvailableCount() const
 {
-	return (BaseColor ? 1 : 0) + (Normal ? 1 : 0) + (Orm ? 1 : 0);
+	return (bHasBaseColor ? 1 : 0) + (bHasNormal ? 1 : 0) + (bHasOrm ? 1 : 0);
 }
 
 void FOcrTextureToolsModule::StartupModule()
@@ -215,6 +225,7 @@ void FOcrTextureToolsModule::StartupModule()
 void FOcrTextureToolsModule::ShutdownModule()
 {
 	UnregisterDelegates();
+	ReportedConfigurationErrors.Reset();
 	ReportedIncompleteGroups.Reset();
 	PendingTextureOperations.Reset();
 	PendingStaticMeshOperations.Reset();
@@ -225,6 +236,8 @@ void FOcrTextureToolsModule::ShutdownModule()
 		FTSTicker::GetCoreTicker().RemoveTicker(PendingImportTickerHandle);
 		PendingImportTickerHandle.Reset();
 	}
+
+	PendingImportOperationDeadline = 0.0;
 }
 
 void FOcrTextureToolsModule::RegisterDelegates()
@@ -402,7 +415,9 @@ bool FOcrTextureToolsModule::TryBuildManagedTextureInfo(UTexture2D* Texture, FMa
 	TargetRoot.RemoveFromEnd(TEXT("/"));
 	if (!TargetRoot.StartsWith(TEXT("/Game")))
 	{
-		UE_LOG(LogOcrTextureTools, Error, TEXT("TargetRootContentPath must start with /Game. Current value: %s"), *TargetRoot);
+		const FString ErrorMessage = FString::Printf(TEXT("TargetRootContentPath must be set and start with /Game. Current value: %s"), *TargetRoot);
+		UE_LOG(LogOcrTextureTools, Error, TEXT("%s"), *ErrorMessage);
+		ReportConfigurationError(TEXT("TargetRootContentPath"), ErrorMessage);
 		return false;
 	}
 
@@ -473,7 +488,9 @@ bool FOcrTextureToolsModule::TryBuildManagedStaticMeshInfo(UStaticMesh* StaticMe
 	FString MaterialRootPath = TrimManagedContentRoot(Settings->TargetRootContentPath);
 	if (!MaterialRootPath.StartsWith(TEXT("/Game")))
 	{
-		UE_LOG(LogOcrTextureTools, Error, TEXT("TargetRootContentPath must start with /Game before static mesh material assignment can run. Current value: %s"), *MaterialRootPath);
+		const FString ErrorMessage = FString::Printf(TEXT("TargetRootContentPath must be set and start with /Game before static mesh material assignment can run. Current value: %s"), *MaterialRootPath);
+		UE_LOG(LogOcrTextureTools, Error, TEXT("%s"), *ErrorMessage);
+		ReportConfigurationError(TEXT("TargetRootContentPath"), ErrorMessage);
 		return false;
 	}
 
@@ -498,7 +515,9 @@ bool FOcrTextureToolsModule::TryBuildManagedStaticMeshInfo(UStaticMesh* StaticMe
 
 	if (!StaticMeshTargetRootPath.StartsWith(TEXT("/Game")))
 	{
-		UE_LOG(LogOcrTextureTools, Error, TEXT("StaticMeshTargetRootContentPath must start with /Game. Current value: %s"), *StaticMeshTargetRootPath);
+		const FString ErrorMessage = FString::Printf(TEXT("StaticMeshTargetRootContentPath must be set and start with /Game. Current value: %s"), *StaticMeshTargetRootPath);
+		UE_LOG(LogOcrTextureTools, Error, TEXT("%s"), *ErrorMessage);
+		ReportConfigurationError(TEXT("StaticMeshTargetRootContentPath"), ErrorMessage);
 		return false;
 	}
 
@@ -542,6 +561,9 @@ bool FOcrTextureToolsModule::TryBuildManagedFallbackMaterialInfo(UMaterialInterf
 	FString StaticMeshTargetRootPath = TrimManagedContentRoot(Settings->StaticMeshTargetRootContentPath);
 	if (!StaticMeshTargetRootPath.StartsWith(TEXT("/Game")))
 	{
+		const FString ErrorMessage = FString::Printf(TEXT("StaticMeshTargetRootContentPath must be set and start with /Game before fallback material archiving can run. Current value: %s"), *StaticMeshTargetRootPath);
+		UE_LOG(LogOcrTextureTools, Error, TEXT("%s"), *ErrorMessage);
+		ReportConfigurationError(TEXT("StaticMeshTargetRootContentPath"), ErrorMessage);
 		return false;
 	}
 
@@ -841,6 +863,7 @@ bool FOcrTextureToolsModule::GatherManagedTextureGroups(const FString& TargetFol
 		return false;
 	}
 
+	TMap<FString, FManagedTextureAssetDataGroup> AssetGroups;
 	for (const FAssetData& AssetData : AssetDataArray)
 	{
 		if (AssetData.AssetClassPath != UTexture2D::StaticClass()->GetClassPathName())
@@ -855,26 +878,54 @@ bool FOcrTextureToolsModule::GatherManagedTextureGroups(const FString& TargetFol
 			continue;
 		}
 
-		UTexture2D* Texture = Cast<UTexture2D>(AssetData.GetAsset());
-		if (!Texture)
+		FManagedTextureAssetDataGroup& Group = AssetGroups.FindOrAdd(GroupName);
+		switch (Kind)
+		{
+		case EManagedTextureKind::BaseColor:
+			Group.bHasBaseColor = true;
+			Group.BaseColorAssetData = AssetData;
+			break;
+		case EManagedTextureKind::Normal:
+			Group.bHasNormal = true;
+			Group.NormalAssetData = AssetData;
+			break;
+		case EManagedTextureKind::Orm:
+			Group.bHasOrm = true;
+			Group.OrmAssetData = AssetData;
+			break;
+		default:
+			break;
+		}
+	}
+
+	for (const TPair<FString, FManagedTextureAssetDataGroup>& Pair : AssetGroups)
+	{
+		const FManagedTextureAssetDataGroup& AssetGroup = Pair.Value;
+		FManagedTextureGroup& Group = OutGroups.FindOrAdd(Pair.Key);
+		Group.bHasBaseColor = AssetGroup.bHasBaseColor;
+		Group.bHasNormal = AssetGroup.bHasNormal;
+		Group.bHasOrm = AssetGroup.bHasOrm;
+
+		if (!Group.IsComplete())
 		{
 			continue;
 		}
 
-		FManagedTextureGroup& Group = OutGroups.FindOrAdd(GroupName);
-		switch (Kind)
+		Group.BaseColor = Cast<UTexture2D>(AssetGroup.BaseColorAssetData.GetAsset());
+		Group.Normal = Cast<UTexture2D>(AssetGroup.NormalAssetData.GetAsset());
+		Group.Orm = Cast<UTexture2D>(AssetGroup.OrmAssetData.GetAsset());
+
+		if (!Group.BaseColor)
 		{
-		case EManagedTextureKind::BaseColor:
-			Group.BaseColor = Texture;
-			break;
-		case EManagedTextureKind::Normal:
-			Group.Normal = Texture;
-			break;
-		case EManagedTextureKind::Orm:
-			Group.Orm = Texture;
-			break;
-		default:
-			break;
+			Group.bHasBaseColor = false;
+		}
+		if (!Group.Normal)
+		{
+			Group.bHasNormal = false;
+		}
+		if (!Group.Orm)
+		{
+			Group.bHasOrm = false;
 		}
 	}
 
@@ -1358,6 +1409,17 @@ void FOcrTextureToolsModule::NotifyUser(const FString& Message, bool bIsSuccess)
 	}
 }
 
+void FOcrTextureToolsModule::ReportConfigurationError(const FString& Key, const FString& Message) const
+{
+	if (Key.IsEmpty() || ReportedConfigurationErrors.Contains(Key))
+	{
+		return;
+	}
+
+	ReportedConfigurationErrors.Add(Key);
+	NotifyUser(Message, false);
+}
+
 void FOcrTextureToolsModule::ReportIncompleteGroup(const FManagedTextureInfo& Info, const FManagedTextureGroup& Group, const TCHAR* InReason)
 {
 	const FString MissingDescription = Group.DescribeMissing();
@@ -1398,7 +1460,7 @@ void FOcrTextureToolsModule::QueuePendingTextureOperation(UTexture2D* Texture, c
 	Operation.Info = Info;
 
 	PendingTextureOperations.Add(Info.TargetTextureAssetPath, Operation);
-	PendingTextureOperationDeadline = FPlatformTime::Seconds() + 1.5;
+	PendingImportOperationDeadline = FPlatformTime::Seconds() + 1.5;
 
 	if (!PendingImportTickerHandle.IsValid())
 	{
@@ -1415,7 +1477,7 @@ void FOcrTextureToolsModule::QueuePendingStaticMeshOperation(UStaticMesh* Static
 	Operation.Info = Info;
 
 	PendingStaticMeshOperations.Add(StaticMesh->GetOutermost()->GetName(), Operation);
-	PendingTextureOperationDeadline = FPlatformTime::Seconds() + 1.5;
+	PendingImportOperationDeadline = FPlatformTime::Seconds() + 1.5;
 
 	if (!PendingImportTickerHandle.IsValid())
 	{
@@ -1432,7 +1494,7 @@ void FOcrTextureToolsModule::QueuePendingFallbackMaterialOperation(UMaterialInte
 	Operation.Info = Info;
 
 	PendingFallbackMaterialOperations.Add(Info.TargetAssetPath, Operation);
-	PendingTextureOperationDeadline = FPlatformTime::Seconds() + 1.5;
+	PendingImportOperationDeadline = FPlatformTime::Seconds() + 1.5;
 
 	if (!PendingImportTickerHandle.IsValid())
 	{
@@ -1444,7 +1506,7 @@ void FOcrTextureToolsModule::QueuePendingFallbackMaterialOperation(UMaterialInte
 
 bool FOcrTextureToolsModule::FlushPendingImportOperations(float DeltaTime)
 {
-	if (FPlatformTime::Seconds() < PendingTextureOperationDeadline)
+	if (FPlatformTime::Seconds() < PendingImportOperationDeadline)
 	{
 		return true;
 	}
@@ -1461,7 +1523,7 @@ bool FOcrTextureToolsModule::FlushPendingImportOperations(float DeltaTime)
 	PendingFallbackMaterialOperations.GenerateValueArray(PendingFallbackMaterialOps);
 	PendingFallbackMaterialOperations.Reset();
 
-	PendingTextureOperationDeadline = 0.0;
+	PendingImportOperationDeadline = 0.0;
 
 	TMap<FString, FManagedTextureInfo> FolderInfos;
 	for (const FPendingTextureOperation& Operation : PendingTextureOps)

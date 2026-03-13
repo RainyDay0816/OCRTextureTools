@@ -15,7 +15,7 @@ public:
 
 	virtual FName GetCategoryName() const override;
 
-	UPROPERTY(Config, EditAnywhere, Category="OCR Rules", Meta=(ClampMin="1"))
+	UPROPERTY(Config, EditAnywhere, Category="OCR Rules")
 	bool bEnableAutomaticProcessing;
 
 	UPROPERTY(Config, EditAnywhere, Category="Import Scope")

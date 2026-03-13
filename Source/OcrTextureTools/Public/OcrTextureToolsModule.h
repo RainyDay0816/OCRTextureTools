@@ -33,6 +33,9 @@ struct FManagedTextureInfo
 
 struct FManagedTextureGroup
 {
+	bool bHasBaseColor = false;
+	bool bHasNormal = false;
+	bool bHasOrm = false;
 	TObjectPtr<UTexture2D> BaseColor = nullptr;
 	TObjectPtr<UTexture2D> Normal = nullptr;
 	TObjectPtr<UTexture2D> Orm = nullptr;
@@ -108,6 +111,7 @@ private:
 	bool ApplyManagedMaterialInstances(UStaticMesh* StaticMesh, const FManagedStaticMeshInfo& Info) const;
 	bool ArchiveImportedFallbackMaterials(UStaticMesh* StaticMesh, const FManagedStaticMeshInfo& Info) const;
 	void NotifyUser(const FString& Message, bool bIsSuccess) const;
+	void ReportConfigurationError(const FString& Key, const FString& Message) const;
 	void ReportIncompleteGroup(const FManagedTextureInfo& Info, const FManagedTextureGroup& Group, const TCHAR* InReason);
 	void ClearIncompleteReport(const FManagedTextureInfo& Info);
 	UEditorAssetSubsystem* GetEditorAssetSubsystem() const;
@@ -124,9 +128,10 @@ private:
 	FDelegateHandle ReimportHandle;
 	FTSTicker::FDelegateHandle PendingImportTickerHandle;
 	TWeakObjectPtr<UImportSubsystem> CachedImportSubsystem;
+	mutable TSet<FString> ReportedConfigurationErrors;
 	TSet<FString> ReportedIncompleteGroups;
 	TMap<FString, FPendingTextureOperation> PendingTextureOperations;
 	TMap<FString, FPendingStaticMeshOperation> PendingStaticMeshOperations;
 	TMap<FString, FPendingFallbackMaterialOperation> PendingFallbackMaterialOperations;
-	double PendingTextureOperationDeadline = 0.0;
+	double PendingImportOperationDeadline = 0.0;
 };
