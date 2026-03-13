@@ -5,6 +5,7 @@ UOcrTextureToolsSettings::UOcrTextureToolsSettings()
 	bEnableAutomaticProcessing = false;
 	WatchedSourceRoot.Path.Reset();
 	TargetRootContentPath.Reset();
+	StaticMeshTargetRootContentPath.Reset();
 	bCaseSensitiveSuffixMatch = false;
 	BaseColorSuffix = TEXT("_BaseColor");
 	NormalSuffix = TEXT("_Normal");

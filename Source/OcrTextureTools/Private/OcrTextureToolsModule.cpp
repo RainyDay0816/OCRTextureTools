@@ -5,6 +5,7 @@
 #include "Containers/Ticker.h"
 #include "Editor.h"
 #include "EditorFramework/AssetImportData.h"
+#include "Engine/StaticMesh.h"
 #include "Engine/Texture2D.h"
 #include "Factories/Factory.h"
 #include "Factories/MaterialInstanceConstantFactoryNew.h"
@@ -18,15 +19,162 @@
 #include "OcrTextureToolsSettings.h"
 #include "Subsystems/EditorAssetSubsystem.h"
 #include "Subsystems/ImportSubsystem.h"
+#include "UObject/UnrealType.h"
 #include "Widgets/Notifications/SNotificationList.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogOcrTextureTools, Log, All);
 
 namespace
 {
+	struct FManagedMaterialInstanceAsset
+	{
+		FString AssetName;
+		FString AssetPath;
+		FString NormalizedName;
+	};
+
 	FString BuildIncompleteKey(const FManagedTextureInfo& Info)
 	{
 		return FString::Printf(TEXT("%s|%s"), *Info.TargetFolderPath, *Info.MaterialGroupName);
+	}
+
+	bool IsAllDigits(const FString& Text)
+	{
+		if (Text.IsEmpty())
+		{
+			return false;
+		}
+
+		for (const TCHAR Character : Text)
+		{
+			if (!FChar::IsDigit(Character))
+			{
+				return false;
+			}
+		}
+
+		return true;
+	}
+
+	FString StripNumericSuffix(const FString& Text)
+	{
+		int32 UnderscoreIndex = INDEX_NONE;
+		if (!Text.FindLastChar(TEXT('_'), UnderscoreIndex))
+		{
+			return Text;
+		}
+
+		const FString Suffix = Text.Mid(UnderscoreIndex + 1);
+		return IsAllDigits(Suffix) ? Text.Left(UnderscoreIndex) : Text;
+	}
+
+	FString TrimManagedContentRoot(FString ContentRoot)
+	{
+		ContentRoot.RemoveFromEnd(TEXT("/"));
+		return ContentRoot;
+	}
+
+	FString NormalizeManagedMaterialToken(FString Token, const FString& SourceFolderName)
+	{
+		Token.TrimStartAndEndInline();
+
+		if (Token.StartsWith(TEXT("MI_"), ESearchCase::IgnoreCase))
+		{
+			Token.RightChopInline(3, EAllowShrinking::No);
+		}
+		else if (Token.StartsWith(TEXT("M_"), ESearchCase::IgnoreCase))
+		{
+			Token.RightChopInline(2, EAllowShrinking::No);
+		}
+
+		const FString SourcePrefix = SourceFolderName + TEXT("_");
+		if (!SourceFolderName.IsEmpty() && Token.StartsWith(SourcePrefix, ESearchCase::IgnoreCase))
+		{
+			Token.RightChopInline(SourcePrefix.Len(), EAllowShrinking::No);
+		}
+
+		return StripNumericSuffix(Token);
+	}
+
+	FString BuildManagedMaterialFolderPath(const FString& MaterialRootPath, const FString& SourceFolderName)
+	{
+		return FString::Printf(TEXT("%s/%s"), *MaterialRootPath, *SourceFolderName);
+	}
+
+	FString ResolveManagedAssetNameFromSourceFilename(const FString& SourceFilename, const FString& FallbackAssetName)
+	{
+		const FString SourceAssetLeaf = ObjectTools::SanitizeObjectName(FPaths::GetBaseFilename(SourceFilename));
+		return SourceAssetLeaf.IsEmpty() ? FallbackAssetName : SourceAssetLeaf;
+	}
+
+	FString BuildStaticMeshFallbackFolderPath(const FManagedStaticMeshInfo& Info)
+	{
+		const FString MeshFolderPath = FPaths::GetPath(Info.TargetMeshAssetPath);
+		return MeshFolderPath.IsEmpty()
+			? FString()
+			: FString::Printf(TEXT("%s/_ImportFallback/%s"), *MeshFolderPath, *Info.SourceFolderName);
+	}
+
+	FString BuildStaticMeshDuplicateFolderPath(const FManagedStaticMeshInfo& Info)
+	{
+		const FString MeshFolderPath = FPaths::GetPath(Info.TargetMeshAssetPath);
+		return MeshFolderPath.IsEmpty()
+			? FString()
+			: FString::Printf(TEXT("%s/_DuplicateImports"), *MeshFolderPath);
+	}
+
+	FString BuildAssetPath(const FString& FolderPath, const FString& AssetName)
+	{
+		return FString::Printf(TEXT("%s/%s"), *FolderPath, *AssetName);
+	}
+
+	FString ResolveUniqueAssetPath(UEditorAssetSubsystem* AssetSubsystem, const FString& DesiredAssetPath)
+	{
+		if (!AssetSubsystem || !AssetSubsystem->DoesAssetExist(DesiredAssetPath))
+		{
+			return DesiredAssetPath;
+		}
+
+		FString UniquePackageName;
+		FString UniqueAssetName;
+		FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
+		AssetToolsModule.Get().CreateUniqueAssetName(DesiredAssetPath, TEXT(""), UniquePackageName, UniqueAssetName);
+		return UniquePackageName;
+	}
+
+	FString ResolveStaticMeshSlotToken(const FStaticMaterial& StaticMaterial)
+	{
+		if (StaticMaterial.ImportedMaterialSlotName != NAME_None)
+		{
+			return StaticMaterial.ImportedMaterialSlotName.ToString();
+		}
+
+		if (StaticMaterial.MaterialSlotName != NAME_None)
+		{
+			return StaticMaterial.MaterialSlotName.ToString();
+		}
+
+		return StaticMaterial.MaterialInterface ? StaticMaterial.MaterialInterface->GetName() : FString();
+	}
+
+	void AddUniqueMaterialCandidate(TArray<FString>& CandidateNames, const FString& CandidateName)
+	{
+		if (!CandidateName.IsEmpty())
+		{
+			CandidateNames.AddUnique(CandidateName);
+		}
+	}
+
+	FString GetNormalizedImportFilename(const UMaterialInterface* Material)
+	{
+		if (!Material || !Material->AssetImportData)
+		{
+			return FString();
+		}
+
+		FString ImportFilename = Material->AssetImportData->GetFirstFilename();
+		FPaths::NormalizeFilename(ImportFilename);
+		return ImportFilename;
 	}
 }
 
@@ -69,11 +217,13 @@ void FOcrTextureToolsModule::ShutdownModule()
 	UnregisterDelegates();
 	ReportedIncompleteGroups.Reset();
 	PendingTextureOperations.Reset();
+	PendingStaticMeshOperations.Reset();
+	PendingFallbackMaterialOperations.Reset();
 
-	if (PendingFolderTickerHandle.IsValid())
+	if (PendingImportTickerHandle.IsValid())
 	{
-		FTSTicker::GetCoreTicker().RemoveTicker(PendingFolderTickerHandle);
-		PendingFolderTickerHandle.Reset();
+		FTSTicker::GetCoreTicker().RemoveTicker(PendingImportTickerHandle);
+		PendingImportTickerHandle.Reset();
 	}
 }
 
@@ -87,7 +237,7 @@ void FOcrTextureToolsModule::RegisterDelegates()
 	UImportSubsystem* ImportSubsystem = GEditor->GetEditorSubsystem<UImportSubsystem>();
 	if (!ImportSubsystem)
 	{
-		UE_LOG(LogOcrTextureTools, Warning, TEXT("Import subsystem not available; texture automation disabled."));
+		UE_LOG(LogOcrTextureTools, Warning, TEXT("Import subsystem not available; import automation disabled."));
 		return;
 	}
 
@@ -143,11 +293,26 @@ void FOcrTextureToolsModule::HandleAssetReimport(UObject* InCreatedObject)
 void FOcrTextureToolsModule::ProcessImportedObject(UObject* InObject, const TCHAR* InReason)
 {
 	UTexture2D* Texture = Cast<UTexture2D>(InObject);
-	if (!Texture)
+	if (Texture)
 	{
+		ProcessImportedTexture(Texture, InReason);
 		return;
 	}
 
+	if (UStaticMesh* StaticMesh = Cast<UStaticMesh>(InObject))
+	{
+		ProcessImportedStaticMesh(StaticMesh, InReason);
+		return;
+	}
+
+	if (UMaterialInterface* Material = Cast<UMaterialInterface>(InObject))
+	{
+		ProcessImportedFallbackMaterial(Material, InReason);
+	}
+}
+
+void FOcrTextureToolsModule::ProcessImportedTexture(UTexture2D* Texture, const TCHAR* InReason)
+{
 	FManagedTextureInfo TextureInfo;
 	if (!TryBuildManagedTextureInfo(Texture, TextureInfo))
 	{
@@ -155,6 +320,28 @@ void FOcrTextureToolsModule::ProcessImportedObject(UObject* InObject, const TCHA
 	}
 
 	QueuePendingTextureOperation(Texture, TextureInfo);
+}
+
+void FOcrTextureToolsModule::ProcessImportedStaticMesh(UStaticMesh* StaticMesh, const TCHAR* InReason)
+{
+	FManagedStaticMeshInfo StaticMeshInfo;
+	if (!TryBuildManagedStaticMeshInfo(StaticMesh, StaticMeshInfo))
+	{
+		return;
+	}
+
+	QueuePendingStaticMeshOperation(StaticMesh, StaticMeshInfo);
+}
+
+void FOcrTextureToolsModule::ProcessImportedFallbackMaterial(UMaterialInterface* Material, const TCHAR* InReason)
+{
+	FManagedFallbackMaterialInfo MaterialInfo;
+	if (!TryBuildManagedFallbackMaterialInfo(Material, MaterialInfo))
+	{
+		return;
+	}
+
+	QueuePendingFallbackMaterialOperation(Material, MaterialInfo);
 }
 
 bool FOcrTextureToolsModule::TryBuildManagedTextureInfo(UTexture2D* Texture, FManagedTextureInfo& OutInfo) const
@@ -232,6 +419,152 @@ bool FOcrTextureToolsModule::TryBuildManagedTextureInfo(UTexture2D* Texture, FMa
 	OutInfo.MaterialGroupName = MaterialGroupName;
 	OutInfo.TargetFolderPath = FString::Printf(TEXT("%s/%s"), *TargetRoot, *FolderName);
 	OutInfo.TargetTextureAssetPath = FString::Printf(TEXT("%s/%s"), *OutInfo.TargetFolderPath, *Texture->GetName());
+	return true;
+}
+
+bool FOcrTextureToolsModule::TryBuildManagedStaticMeshInfo(UStaticMesh* StaticMesh, FManagedStaticMeshInfo& OutInfo) const
+{
+	if (!StaticMesh)
+	{
+		return false;
+	}
+
+	const UOcrTextureToolsSettings* Settings = GetDefault<UOcrTextureToolsSettings>();
+	if (!Settings || !Settings->bEnableAutomaticProcessing)
+	{
+		return false;
+	}
+
+	UAssetImportData* AssetImportData = StaticMesh->GetAssetImportData();
+	if (!AssetImportData)
+	{
+		UE_LOG(LogOcrTextureTools, Warning, TEXT("Static mesh %s has no asset import data; skipping automation."), *StaticMesh->GetPathName());
+		return false;
+	}
+
+	FString SourceFilename = AssetImportData->GetFirstFilename();
+	if (SourceFilename.IsEmpty())
+	{
+		UE_LOG(LogOcrTextureTools, Warning, TEXT("Static mesh %s has no source filename; skipping automation."), *StaticMesh->GetPathName());
+		return false;
+	}
+
+	FPaths::NormalizeFilename(SourceFilename);
+	const FString SourceDirectory = FPaths::GetPath(SourceFilename);
+
+	if (!Settings->WatchedSourceRoot.Path.IsEmpty())
+	{
+		FString WatchedRoot = Settings->WatchedSourceRoot.Path;
+		FPaths::NormalizeDirectoryName(WatchedRoot);
+
+		if (!FPaths::IsUnderDirectory(SourceDirectory, WatchedRoot) && !SourceDirectory.Equals(WatchedRoot, ESearchCase::IgnoreCase))
+		{
+			return false;
+		}
+	}
+
+	const FString SourceFolderLeaf = FPaths::GetCleanFilename(SourceDirectory);
+	if (SourceFolderLeaf.IsEmpty())
+	{
+		UE_LOG(LogOcrTextureTools, Warning, TEXT("Static mesh %s source folder could not be resolved from %s."), *StaticMesh->GetPathName(), *SourceFilename);
+		return false;
+	}
+
+	FString MaterialRootPath = TrimManagedContentRoot(Settings->TargetRootContentPath);
+	if (!MaterialRootPath.StartsWith(TEXT("/Game")))
+	{
+		UE_LOG(LogOcrTextureTools, Error, TEXT("TargetRootContentPath must start with /Game before static mesh material assignment can run. Current value: %s"), *MaterialRootPath);
+		return false;
+	}
+
+	const FString SourceFolderName = ObjectTools::SanitizeObjectName(SourceFolderLeaf);
+	if (SourceFolderName.IsEmpty())
+	{
+		UE_LOG(LogOcrTextureTools, Warning, TEXT("Static mesh source folder %s resolved to an empty Unreal name."), *SourceFolderLeaf);
+		return false;
+	}
+
+	OutInfo.SourceFilename = SourceFilename;
+	OutInfo.SourceFolderName = SourceFolderName;
+	OutInfo.MeshAssetName = ResolveManagedAssetNameFromSourceFilename(SourceFilename, StaticMesh->GetName());
+	OutInfo.MaterialFolderPath = BuildManagedMaterialFolderPath(MaterialRootPath, SourceFolderName);
+
+	FString StaticMeshTargetRootPath = TrimManagedContentRoot(Settings->StaticMeshTargetRootContentPath);
+	if (StaticMeshTargetRootPath.IsEmpty())
+	{
+		OutInfo.TargetMeshAssetPath = StaticMesh->GetOutermost()->GetName();
+		return true;
+	}
+
+	if (!StaticMeshTargetRootPath.StartsWith(TEXT("/Game")))
+	{
+		UE_LOG(LogOcrTextureTools, Error, TEXT("StaticMeshTargetRootContentPath must start with /Game. Current value: %s"), *StaticMeshTargetRootPath);
+		return false;
+	}
+
+	OutInfo.TargetMeshAssetPath = BuildAssetPath(StaticMeshTargetRootPath, OutInfo.MeshAssetName);
+	return true;
+}
+
+bool FOcrTextureToolsModule::TryBuildManagedFallbackMaterialInfo(UMaterialInterface* Material, FManagedFallbackMaterialInfo& OutInfo) const
+{
+	if (!Material || !Material->AssetImportData)
+	{
+		return false;
+	}
+
+	const UOcrTextureToolsSettings* Settings = GetDefault<UOcrTextureToolsSettings>();
+	if (!Settings || !Settings->bEnableAutomaticProcessing)
+	{
+		return false;
+	}
+
+	FString SourceFilename = Material->AssetImportData->GetFirstFilename();
+	if (SourceFilename.IsEmpty())
+	{
+		return false;
+	}
+
+	FPaths::NormalizeFilename(SourceFilename);
+	const FString SourceDirectory = FPaths::GetPath(SourceFilename);
+
+	if (!Settings->WatchedSourceRoot.Path.IsEmpty())
+	{
+		FString WatchedRoot = Settings->WatchedSourceRoot.Path;
+		FPaths::NormalizeDirectoryName(WatchedRoot);
+
+		if (!FPaths::IsUnderDirectory(SourceDirectory, WatchedRoot) && !SourceDirectory.Equals(WatchedRoot, ESearchCase::IgnoreCase))
+		{
+			return false;
+		}
+	}
+
+	FString StaticMeshTargetRootPath = TrimManagedContentRoot(Settings->StaticMeshTargetRootContentPath);
+	if (!StaticMeshTargetRootPath.StartsWith(TEXT("/Game")))
+	{
+		return false;
+	}
+
+	const FString SourceFolderLeaf = FPaths::GetCleanFilename(SourceDirectory);
+	const FString SourceFolderName = ObjectTools::SanitizeObjectName(SourceFolderLeaf);
+	if (SourceFolderName.IsEmpty())
+	{
+		return false;
+	}
+
+	const FString CurrentAssetPath = Material->GetOutermost()->GetName();
+	const FString TargetFolderPath = FString::Printf(TEXT("%s/_ImportFallback/%s"), *StaticMeshTargetRootPath, *SourceFolderName);
+	const FString TargetAssetPath = FString::Printf(TEXT("%s/%s"), *TargetFolderPath, *Material->GetName());
+
+	if (CurrentAssetPath.Equals(TargetAssetPath, ESearchCase::CaseSensitive))
+	{
+		return false;
+	}
+
+	OutInfo.SourceFilename = SourceFilename;
+	OutInfo.SourceFolderName = SourceFolderName;
+	OutInfo.TargetFolderPath = TargetFolderPath;
+	OutInfo.TargetAssetPath = TargetAssetPath;
 	return true;
 }
 
@@ -364,6 +697,137 @@ bool FOcrTextureToolsModule::MoveTextureToManagedFolder(UTexture2D* Texture, con
 		*CurrentAssetPath,
 		*Info.TargetTextureAssetPath,
 		*Info.SourceFolderName);
+	return true;
+}
+
+bool FOcrTextureToolsModule::MoveStaticMeshToManagedFolder(UStaticMesh* StaticMesh, const FManagedStaticMeshInfo& Info) const
+{
+	if (!StaticMesh || Info.TargetMeshAssetPath.IsEmpty())
+	{
+		return false;
+	}
+
+	UEditorAssetSubsystem* AssetSubsystem = GetEditorAssetSubsystem();
+	if (!AssetSubsystem)
+	{
+		UE_LOG(LogOcrTextureTools, Error, TEXT("Editor asset subsystem unavailable; cannot move static mesh %s."), *StaticMesh->GetPathName());
+		return false;
+	}
+
+	const FString CurrentAssetPath = StaticMesh->GetOutermost()->GetName();
+	if (CurrentAssetPath.Equals(Info.TargetMeshAssetPath, ESearchCase::CaseSensitive))
+	{
+		return true;
+	}
+
+	const FString DuplicateFolderPath = BuildStaticMeshDuplicateFolderPath(Info);
+	if (!DuplicateFolderPath.IsEmpty())
+	{
+		const FString DuplicateFolderPrefix = DuplicateFolderPath + TEXT("/");
+		if (CurrentAssetPath.StartsWith(DuplicateFolderPrefix, ESearchCase::IgnoreCase))
+		{
+			return true;
+		}
+	}
+
+	FString DestinationAssetPath = Info.TargetMeshAssetPath;
+	if (AssetSubsystem->DoesAssetExist(Info.TargetMeshAssetPath))
+	{
+		if (DuplicateFolderPath.IsEmpty() || !EnsureTargetFolder(DuplicateFolderPath))
+		{
+			UE_LOG(
+				LogOcrTextureTools,
+				Error,
+				TEXT("Failed to ensure duplicate static mesh folder %s for %s."),
+				*DuplicateFolderPath,
+				*CurrentAssetPath);
+			NotifyUser(FString::Printf(TEXT("Failed to create duplicate static mesh folder: %s"), *DuplicateFolderPath), false);
+			return false;
+		}
+
+		DestinationAssetPath = ResolveUniqueAssetPath(AssetSubsystem, BuildAssetPath(DuplicateFolderPath, Info.MeshAssetName));
+		UE_LOG(
+			LogOcrTextureTools,
+			Warning,
+			TEXT("Target static mesh %s already exists. Routing imported mesh %s to duplicate path %s."),
+			*Info.TargetMeshAssetPath,
+			*CurrentAssetPath,
+			*DestinationAssetPath);
+	}
+
+	const FString TargetFolderPath = FPaths::GetPath(DestinationAssetPath);
+	if (TargetFolderPath.IsEmpty() || !EnsureTargetFolder(TargetFolderPath))
+	{
+		UE_LOG(LogOcrTextureTools, Error, TEXT("Failed to ensure static mesh target folder %s for %s."), *TargetFolderPath, *CurrentAssetPath);
+		NotifyUser(FString::Printf(TEXT("Failed to create static mesh folder: %s"), *TargetFolderPath), false);
+		return false;
+	}
+
+	if (!AssetSubsystem->RenameLoadedAsset(StaticMesh, DestinationAssetPath))
+	{
+		UE_LOG(
+			LogOcrTextureTools,
+			Error,
+			TEXT("Failed to move static mesh %s to %s."),
+			*CurrentAssetPath,
+			*DestinationAssetPath);
+		NotifyUser(FString::Printf(TEXT("Failed to move static mesh: %s"), *StaticMesh->GetName()), false);
+		return false;
+	}
+
+	UE_LOG(
+		LogOcrTextureTools,
+		Log,
+		TEXT("Moved static mesh %s to %s based on source folder %s."),
+		*CurrentAssetPath,
+		*DestinationAssetPath,
+		*Info.SourceFolderName);
+	return true;
+}
+
+bool FOcrTextureToolsModule::MoveFallbackMaterialToManagedFolder(UMaterialInterface* Material, const FManagedFallbackMaterialInfo& Info) const
+{
+	if (!Material)
+	{
+		return false;
+	}
+
+	UEditorAssetSubsystem* AssetSubsystem = GetEditorAssetSubsystem();
+	if (!AssetSubsystem)
+	{
+		return false;
+	}
+
+	const FString CurrentAssetPath = Material->GetOutermost()->GetName();
+	if (CurrentAssetPath.Equals(Info.TargetAssetPath, ESearchCase::CaseSensitive))
+	{
+		return true;
+	}
+
+	if (!EnsureTargetFolder(Info.TargetFolderPath))
+	{
+		UE_LOG(
+			LogOcrTextureTools,
+			Warning,
+			TEXT("Failed to ensure fallback material folder %s for %s."),
+			*Info.TargetFolderPath,
+			*CurrentAssetPath);
+		return false;
+	}
+
+	FString DestinationAssetPath = ResolveUniqueAssetPath(AssetSubsystem, Info.TargetAssetPath);
+
+	if (!AssetSubsystem->RenameLoadedAsset(Material, DestinationAssetPath))
+	{
+		UE_LOG(
+			LogOcrTextureTools,
+			Warning,
+			TEXT("Failed to move imported fallback material %s to %s."),
+			*CurrentAssetPath,
+			*DestinationAssetPath);
+		return false;
+	}
+
 	return true;
 }
 
@@ -549,6 +1013,332 @@ bool FOcrTextureToolsModule::UpdateMaterialInstance(const FManagedTextureInfo& I
 	return bAllParametersApplied;
 }
 
+bool FOcrTextureToolsModule::ArchiveImportedFallbackMaterials(UStaticMesh* StaticMesh, const FManagedStaticMeshInfo& Info) const
+{
+	if (!StaticMesh)
+	{
+		return false;
+	}
+
+	UEditorAssetSubsystem* AssetSubsystem = GetEditorAssetSubsystem();
+	if (!AssetSubsystem)
+	{
+		return false;
+	}
+
+	const FString FallbackFolderPath = BuildStaticMeshFallbackFolderPath(Info);
+	if (FallbackFolderPath.IsEmpty())
+	{
+		return false;
+	}
+
+	FString NormalizedSourceFilename = Info.SourceFilename;
+	FPaths::NormalizeFilename(NormalizedSourceFilename);
+
+	TMap<FString, UMaterialInterface*> MaterialsToArchive;
+	for (const FStaticMaterial& StaticMaterial : StaticMesh->GetStaticMaterials())
+	{
+		UMaterialInterface* CurrentMaterial = StaticMaterial.MaterialInterface;
+		if (!CurrentMaterial)
+		{
+			continue;
+		}
+
+		const FString CurrentMaterialPath = CurrentMaterial->GetOutermost()->GetName();
+		if (!CurrentMaterialPath.StartsWith(TEXT("/Game")))
+		{
+			continue;
+		}
+
+		if (CurrentMaterialPath.StartsWith(FallbackFolderPath, ESearchCase::IgnoreCase)
+			|| CurrentMaterialPath.StartsWith(Info.MaterialFolderPath, ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+
+		const FString SlotToken = ResolveStaticMeshSlotToken(StaticMaterial);
+		const FString NormalizedSlotToken = NormalizeManagedMaterialToken(SlotToken, Info.SourceFolderName);
+		const FString NormalizedMaterialName = NormalizeManagedMaterialToken(CurrentMaterial->GetName(), Info.SourceFolderName);
+		const FString MaterialImportFilename = GetNormalizedImportFilename(CurrentMaterial);
+
+		const bool bMatchesImportSource = !MaterialImportFilename.IsEmpty() && MaterialImportFilename.Equals(NormalizedSourceFilename, ESearchCase::IgnoreCase);
+		const bool bMatchesSlotName = !NormalizedSlotToken.IsEmpty() && NormalizedMaterialName.Equals(NormalizedSlotToken, ESearchCase::IgnoreCase);
+		if (!bMatchesImportSource && !bMatchesSlotName)
+		{
+			continue;
+		}
+
+		MaterialsToArchive.Add(CurrentMaterialPath, CurrentMaterial);
+	}
+
+	if (MaterialsToArchive.IsEmpty())
+	{
+		return false;
+	}
+
+	if (!EnsureTargetFolder(FallbackFolderPath))
+	{
+		UE_LOG(
+			LogOcrTextureTools,
+			Warning,
+			TEXT("Failed to ensure fallback material folder %s for static mesh %s."),
+			*FallbackFolderPath,
+			*StaticMesh->GetPathName());
+		return false;
+	}
+
+	FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
+	int32 ArchivedCount = 0;
+
+	for (const TPair<FString, UMaterialInterface*>& Pair : MaterialsToArchive)
+	{
+		UMaterialInterface* Material = Pair.Value;
+		if (!Material)
+		{
+			continue;
+		}
+
+		const FString BaseAssetPath = FString::Printf(TEXT("%s/%s"), *FallbackFolderPath, *Material->GetName());
+		FString DestinationAssetPath = BaseAssetPath;
+
+		if (AssetSubsystem->DoesAssetExist(DestinationAssetPath))
+		{
+			FString UniquePackageName;
+			FString UniqueAssetName;
+			AssetToolsModule.Get().CreateUniqueAssetName(BaseAssetPath, TEXT(""), UniquePackageName, UniqueAssetName);
+			DestinationAssetPath = UniquePackageName;
+		}
+
+		if (!AssetSubsystem->RenameLoadedAsset(Material, DestinationAssetPath))
+		{
+			UE_LOG(
+				LogOcrTextureTools,
+				Warning,
+				TEXT("Failed to move imported fallback material %s to %s."),
+				*Pair.Key,
+				*DestinationAssetPath);
+			continue;
+		}
+
+		ArchivedCount++;
+	}
+
+	if (ArchivedCount > 0)
+	{
+		UE_LOG(
+			LogOcrTextureTools,
+			Log,
+			TEXT("Archived %d imported fallback materials for %s into %s."),
+			ArchivedCount,
+			*StaticMesh->GetPathName(),
+			*FallbackFolderPath);
+	}
+
+	return ArchivedCount > 0;
+}
+
+bool FOcrTextureToolsModule::ApplyManagedMaterialInstances(UStaticMesh* StaticMesh, const FManagedStaticMeshInfo& Info) const
+{
+	if (!StaticMesh)
+	{
+		return false;
+	}
+
+	FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry");
+
+	TArray<FAssetData> AssetDataArray;
+	if (!AssetRegistryModule.Get().GetAssetsByPath(FName(*Info.MaterialFolderPath), AssetDataArray, false, false))
+	{
+		UE_LOG(
+			LogOcrTextureTools,
+			Warning,
+			TEXT("Managed material folder %s could not be scanned for static mesh %s."),
+			*Info.MaterialFolderPath,
+			*StaticMesh->GetPathName());
+		return false;
+	}
+
+	TArray<FManagedMaterialInstanceAsset> ManagedMaterials;
+	for (const FAssetData& AssetData : AssetDataArray)
+	{
+		if (AssetData.AssetClassPath != UMaterialInstanceConstant::StaticClass()->GetClassPathName())
+		{
+			continue;
+		}
+
+		FManagedMaterialInstanceAsset& ManagedMaterial = ManagedMaterials.AddDefaulted_GetRef();
+		ManagedMaterial.AssetName = AssetData.AssetName.ToString();
+		ManagedMaterial.AssetPath = AssetData.GetObjectPathString();
+		ManagedMaterial.NormalizedName = NormalizeManagedMaterialToken(ManagedMaterial.AssetName, Info.SourceFolderName);
+	}
+
+	if (ManagedMaterials.IsEmpty())
+	{
+		UE_LOG(
+			LogOcrTextureTools,
+			Warning,
+			TEXT("No managed material instances were found in %s for static mesh %s."),
+			*Info.MaterialFolderPath,
+			*StaticMesh->GetPathName());
+		return false;
+	}
+
+	UEditorAssetSubsystem* AssetSubsystem = GetEditorAssetSubsystem();
+	if (!AssetSubsystem)
+	{
+		return false;
+	}
+
+	const TArray<FStaticMaterial>& StaticMaterials = StaticMesh->GetStaticMaterials();
+	if (StaticMaterials.IsEmpty())
+	{
+		return false;
+	}
+
+	TMap<int32, UMaterialInterface*> PendingAssignments;
+	TArray<FString> MissingSlots;
+
+	for (int32 MaterialIndex = 0; MaterialIndex < StaticMaterials.Num(); ++MaterialIndex)
+	{
+		const FStaticMaterial& StaticMaterial = StaticMaterials[MaterialIndex];
+		const FString SlotToken = ResolveStaticMeshSlotToken(StaticMaterial);
+		const FString NormalizedSlotToken = NormalizeManagedMaterialToken(SlotToken, Info.SourceFolderName);
+
+		if (NormalizedSlotToken.IsEmpty())
+		{
+			continue;
+		}
+
+		TArray<FString> CandidateAssetNames;
+		AddUniqueMaterialCandidate(CandidateAssetNames, FString::Printf(TEXT("MI_%s_%s"), *Info.SourceFolderName, *NormalizedSlotToken));
+		AddUniqueMaterialCandidate(CandidateAssetNames, FString::Printf(TEXT("MI_%s"), *NormalizedSlotToken));
+
+		const FString RawNormalizedCurrentMaterial = StaticMaterial.MaterialInterface
+			? NormalizeManagedMaterialToken(StaticMaterial.MaterialInterface->GetName(), Info.SourceFolderName)
+			: FString();
+		if (!RawNormalizedCurrentMaterial.IsEmpty() && RawNormalizedCurrentMaterial != NormalizedSlotToken)
+		{
+			AddUniqueMaterialCandidate(CandidateAssetNames, FString::Printf(TEXT("MI_%s_%s"), *Info.SourceFolderName, *RawNormalizedCurrentMaterial));
+			AddUniqueMaterialCandidate(CandidateAssetNames, FString::Printf(TEXT("MI_%s"), *RawNormalizedCurrentMaterial));
+		}
+
+		const FManagedMaterialInstanceAsset* MatchedAsset = nullptr;
+		for (const FString& CandidateAssetName : CandidateAssetNames)
+		{
+			MatchedAsset = ManagedMaterials.FindByPredicate(
+				[&CandidateAssetName](const FManagedMaterialInstanceAsset& ManagedMaterial)
+				{
+					return ManagedMaterial.AssetName.Equals(CandidateAssetName, ESearchCase::IgnoreCase);
+				});
+			if (MatchedAsset)
+			{
+				break;
+			}
+		}
+
+		if (!MatchedAsset)
+		{
+			TArray<const FManagedMaterialInstanceAsset*> NormalizedMatches;
+			for (const FManagedMaterialInstanceAsset& ManagedMaterial : ManagedMaterials)
+			{
+				if (ManagedMaterial.NormalizedName.Equals(NormalizedSlotToken, ESearchCase::IgnoreCase))
+				{
+					NormalizedMatches.Add(&ManagedMaterial);
+				}
+			}
+
+			if (NormalizedMatches.Num() == 1)
+			{
+				MatchedAsset = NormalizedMatches[0];
+			}
+			else if (NormalizedMatches.Num() > 1)
+			{
+				UE_LOG(
+					LogOcrTextureTools,
+					Warning,
+					TEXT("Multiple managed material instances in %s matched slot %s on %s; leaving slot unchanged."),
+					*Info.MaterialFolderPath,
+					*SlotToken,
+					*StaticMesh->GetPathName());
+				MissingSlots.AddUnique(SlotToken);
+				continue;
+			}
+		}
+
+		if (!MatchedAsset)
+		{
+			MissingSlots.AddUnique(SlotToken);
+			continue;
+		}
+
+		UMaterialInterface* TargetMaterial = Cast<UMaterialInterface>(AssetSubsystem->LoadAsset(MatchedAsset->AssetPath));
+		if (!TargetMaterial)
+		{
+			UE_LOG(
+				LogOcrTextureTools,
+				Warning,
+				TEXT("Managed material instance %s could not be loaded for slot %s on %s."),
+				*MatchedAsset->AssetPath,
+				*SlotToken,
+				*StaticMesh->GetPathName());
+			MissingSlots.AddUnique(SlotToken);
+			continue;
+		}
+
+		if (StaticMaterial.MaterialInterface != TargetMaterial)
+		{
+			PendingAssignments.Add(MaterialIndex, TargetMaterial);
+		}
+	}
+
+	if (!PendingAssignments.IsEmpty())
+	{
+		for (int32 LODIndex = 0; LODIndex < StaticMesh->GetNumSourceModels(); ++LODIndex)
+		{
+			StaticMesh->GetMeshDescription(LODIndex);
+		}
+
+		FProperty* ChangedProperty = FindFProperty<FProperty>(UStaticMesh::StaticClass(), UStaticMesh::GetStaticMaterialsName());
+		check(ChangedProperty);
+
+		StaticMesh->Modify();
+		StaticMesh->PreEditChange(ChangedProperty);
+
+		for (const TPair<int32, UMaterialInterface*>& Assignment : PendingAssignments)
+		{
+			StaticMesh->GetStaticMaterials()[Assignment.Key].MaterialInterface = Assignment.Value;
+		}
+
+		FPropertyChangedEvent PropertyChangedEvent(ChangedProperty);
+		StaticMesh->PostEditChangeProperty(PropertyChangedEvent);
+		StaticMesh->MarkPackageDirty();
+	}
+
+	if (!MissingSlots.IsEmpty())
+	{
+		UE_LOG(
+			LogOcrTextureTools,
+			Warning,
+			TEXT("Static mesh %s did not find managed material instances for slots: %s."),
+			*StaticMesh->GetPathName(),
+			*FString::Join(MissingSlots, TEXT(", ")));
+	}
+
+	if (!PendingAssignments.IsEmpty())
+	{
+		UE_LOG(
+			LogOcrTextureTools,
+			Log,
+			TEXT("Updated %d static mesh material slots on %s from managed folder %s."),
+			PendingAssignments.Num(),
+			*StaticMesh->GetPathName(),
+			*Info.MaterialFolderPath);
+		NotifyUser(FString::Printf(TEXT("Updated %s material slots"), *StaticMesh->GetName()), MissingSlots.IsEmpty());
+	}
+
+	return true;
+}
+
 void FOcrTextureToolsModule::NotifyUser(const FString& Message, bool bIsSuccess) const
 {
 	const UOcrTextureToolsSettings* Settings = GetDefault<UOcrTextureToolsSettings>();
@@ -610,28 +1400,71 @@ void FOcrTextureToolsModule::QueuePendingTextureOperation(UTexture2D* Texture, c
 	PendingTextureOperations.Add(Info.TargetTextureAssetPath, Operation);
 	PendingTextureOperationDeadline = FPlatformTime::Seconds() + 1.5;
 
-	if (!PendingFolderTickerHandle.IsValid())
+	if (!PendingImportTickerHandle.IsValid())
 	{
-		PendingFolderTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
-			FTickerDelegate::CreateRaw(this, &FOcrTextureToolsModule::FlushPendingTextureOperations),
+		PendingImportTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateRaw(this, &FOcrTextureToolsModule::FlushPendingImportOperations),
 			0.25f);
 	}
 }
 
-bool FOcrTextureToolsModule::FlushPendingTextureOperations(float DeltaTime)
+void FOcrTextureToolsModule::QueuePendingStaticMeshOperation(UStaticMesh* StaticMesh, const FManagedStaticMeshInfo& Info)
+{
+	FPendingStaticMeshOperation Operation;
+	Operation.StaticMesh = StaticMesh;
+	Operation.Info = Info;
+
+	PendingStaticMeshOperations.Add(StaticMesh->GetOutermost()->GetName(), Operation);
+	PendingTextureOperationDeadline = FPlatformTime::Seconds() + 1.5;
+
+	if (!PendingImportTickerHandle.IsValid())
+	{
+		PendingImportTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateRaw(this, &FOcrTextureToolsModule::FlushPendingImportOperations),
+			0.25f);
+	}
+}
+
+void FOcrTextureToolsModule::QueuePendingFallbackMaterialOperation(UMaterialInterface* Material, const FManagedFallbackMaterialInfo& Info)
+{
+	FPendingFallbackMaterialOperation Operation;
+	Operation.Material = Material;
+	Operation.Info = Info;
+
+	PendingFallbackMaterialOperations.Add(Info.TargetAssetPath, Operation);
+	PendingTextureOperationDeadline = FPlatformTime::Seconds() + 1.5;
+
+	if (!PendingImportTickerHandle.IsValid())
+	{
+		PendingImportTickerHandle = FTSTicker::GetCoreTicker().AddTicker(
+			FTickerDelegate::CreateRaw(this, &FOcrTextureToolsModule::FlushPendingImportOperations),
+			0.25f);
+	}
+}
+
+bool FOcrTextureToolsModule::FlushPendingImportOperations(float DeltaTime)
 {
 	if (FPlatformTime::Seconds() < PendingTextureOperationDeadline)
 	{
 		return true;
 	}
 
-	TArray<FPendingTextureOperation> PendingOperations;
-	PendingTextureOperations.GenerateValueArray(PendingOperations);
+	TArray<FPendingTextureOperation> PendingTextureOps;
+	PendingTextureOperations.GenerateValueArray(PendingTextureOps);
 	PendingTextureOperations.Reset();
+
+	TArray<FPendingStaticMeshOperation> PendingStaticMeshOps;
+	PendingStaticMeshOperations.GenerateValueArray(PendingStaticMeshOps);
+	PendingStaticMeshOperations.Reset();
+
+	TArray<FPendingFallbackMaterialOperation> PendingFallbackMaterialOps;
+	PendingFallbackMaterialOperations.GenerateValueArray(PendingFallbackMaterialOps);
+	PendingFallbackMaterialOperations.Reset();
+
 	PendingTextureOperationDeadline = 0.0;
 
 	TMap<FString, FManagedTextureInfo> FolderInfos;
-	for (const FPendingTextureOperation& Operation : PendingOperations)
+	for (const FPendingTextureOperation& Operation : PendingTextureOps)
 	{
 		if (ProcessPendingTextureOperation(Operation))
 		{
@@ -646,9 +1479,19 @@ bool FOcrTextureToolsModule::FlushPendingTextureOperations(float DeltaTime)
 		ProcessManagedFolder(FolderInfo);
 	}
 
-	if (PendingTextureOperations.IsEmpty())
+	for (const FPendingFallbackMaterialOperation& Operation : PendingFallbackMaterialOps)
 	{
-		PendingFolderTickerHandle.Reset();
+		ProcessPendingFallbackMaterialOperation(Operation);
+	}
+
+	for (const FPendingStaticMeshOperation& Operation : PendingStaticMeshOps)
+	{
+		ProcessPendingStaticMeshOperation(Operation);
+	}
+
+	if (PendingTextureOperations.IsEmpty() && PendingStaticMeshOperations.IsEmpty() && PendingFallbackMaterialOperations.IsEmpty())
+	{
+		PendingImportTickerHandle.Reset();
 		return false;
 	}
 
@@ -680,6 +1523,40 @@ bool FOcrTextureToolsModule::ProcessPendingTextureOperation(const FPendingTextur
 	}
 
 	return MoveTextureToManagedFolder(Texture, TextureInfo);
+}
+
+bool FOcrTextureToolsModule::ProcessPendingStaticMeshOperation(const FPendingStaticMeshOperation& PendingOperation)
+{
+	UStaticMesh* StaticMesh = PendingOperation.StaticMesh.Get();
+	if (!StaticMesh)
+	{
+		return false;
+	}
+
+	const FManagedStaticMeshInfo& StaticMeshInfo = PendingOperation.Info;
+	if (!MoveStaticMeshToManagedFolder(StaticMesh, StaticMeshInfo))
+	{
+		const FString CurrentAssetPath = StaticMesh->GetOutermost()->GetName();
+		if (!CurrentAssetPath.Equals(StaticMeshInfo.TargetMeshAssetPath, ESearchCase::CaseSensitive))
+		{
+			return false;
+		}
+	}
+
+	ArchiveImportedFallbackMaterials(StaticMesh, StaticMeshInfo);
+	ApplyManagedMaterialInstances(StaticMesh, StaticMeshInfo);
+	return true;
+}
+
+bool FOcrTextureToolsModule::ProcessPendingFallbackMaterialOperation(const FPendingFallbackMaterialOperation& PendingOperation)
+{
+	UMaterialInterface* Material = PendingOperation.Material.Get();
+	if (!Material)
+	{
+		return false;
+	}
+
+	return MoveFallbackMaterialToManagedFolder(Material, PendingOperation.Info);
 }
 
 void FOcrTextureToolsModule::ProcessManagedFolder(const FManagedTextureInfo& FolderInfo)

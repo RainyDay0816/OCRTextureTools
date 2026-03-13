@@ -24,6 +24,9 @@ public:
 	UPROPERTY(Config, EditAnywhere, Category="Import Scope")
 	FString TargetRootContentPath;
 
+	UPROPERTY(Config, EditAnywhere, Category="Import Scope")
+	FString StaticMeshTargetRootContentPath;
+
 	UPROPERTY(Config, EditAnywhere, Category="Suffix Rules")
 	bool bCaseSensitiveSuffixMatch;
 
